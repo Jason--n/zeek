@@ -2,6 +2,9 @@
 
 #include "Manager.h"
 
+#include <sstream>
+#include <iomanip>
+
 #include "Analyzer.h"
 #include "Dispatcher.h"
 #include "zeek-bif.h"
@@ -43,6 +46,14 @@ void Manager::InitPostScript()
 		pkt_profiler = new detail::PacketProfiler(detail::pkt_profile_mode,
 		                                          detail::pkt_profile_freq,
 		                                          pkt_profile_file->AsFile());
+
+	if ( unknown_protocol )
+		{
+		unknown_sampling_rate = id::find_val("UnknownProtocol::sampling_rate")->AsCount();
+		unknown_sampling_threshold = id::find_val("UnknownProtocol::sampling_threshold")->AsCount();
+		unknown_sampling_duration = id::find_val("UnknownProtocol::sampling_duration")->AsInterval();
+		unknown_first_bytes_count = id::find_val("UnknownProtocol::first_bytes_count")->AsCount();
+		}
 	}
 
 void Manager::Done()
@@ -102,7 +113,7 @@ void Manager::ProcessPacket(Packet* packet)
 
 	// Start packet analysis
 	packet->l2_valid = root_analyzer->ForwardPacket(packet->cap_len, packet->data,
-			packet, packet->link_type);
+	                                                packet, packet->link_type);
 
 	if ( raw_packet )
 		event_mgr.Enqueue(raw_packet, packet->ToRawPktHdrVal());
@@ -170,4 +181,68 @@ void Manager::DumpPacket(const Packet *pkt, int len)
 		}
 
 	run_state::detail::pkt_dumper->Dump(pkt);
+	}
+
+class UnknownProtocolTimerTimer final : public zeek::detail::Timer {
+public:
+	using UnknownProtocolPair = std::pair<std::string, uint32_t>;
+
+	UnknownProtocolTimerTimer(double t, UnknownProtocolPair p, double timeout)
+		: zeek::detail::Timer(t + timeout, zeek::detail::TIMER_UNKNOWN_PROTOCOL_EXPIRE),
+		  unknown_protocol(std::move(p))
+		{}
+
+	void Dispatch(double t, bool is_expire) override
+		{ zeek::packet_mgr->ResetUnknownProtocolTimer(unknown_protocol.first, unknown_protocol.second); }
+
+	UnknownProtocolPair unknown_protocol;
+};
+
+void Manager::ResetUnknownProtocolTimer(const std::string& analyzer, uint32_t protocol)
+	{
+	unknown_protocols.erase(std::make_pair(analyzer, protocol));
+	}
+
+bool Manager::PermitUnknownProtocol(const std::string& analyzer, uint32_t protocol)
+	{
+	auto p = std::make_pair(analyzer, protocol);
+	uint64_t& count = unknown_protocols[p];
+	++count;
+
+	if ( count == 1 )
+		detail::timer_mgr->Add(new UnknownProtocolTimerTimer(run_state::network_time, p,
+		                                                     unknown_sampling_duration));
+
+	if ( count < unknown_sampling_threshold )
+		return true;
+
+	auto num_above_threshold = count - unknown_sampling_threshold;
+	if ( unknown_sampling_rate )
+		return num_above_threshold % unknown_sampling_rate == 0;
+
+	return false;
+	}
+
+void Manager::ReportUnknownProtocol(const std::string& analyzer, uint32_t protocol,
+                                    const uint8_t* data, size_t len)
+	{
+	if ( unknown_protocol )
+		{
+		if ( PermitUnknownProtocol(analyzer, protocol ) )
+			{
+			std::stringstream ss;
+
+			if ( data )
+				{
+				ss << std::hex;
+				for ( int i = 0; i < unknown_first_bytes_count && i < len; i++ )
+					ss << std::setw(2) << std::setfill('0') << (int)data[i];
+				}
+
+			event_mgr.Enqueue(unknown_protocol,
+			                  make_intrusive<StringVal>(analyzer),
+			                  val_mgr->Count(protocol),
+			                  make_intrusive<StringVal>(ss.str()));
+			}
+		}
 	}
