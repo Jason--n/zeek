@@ -322,7 +322,9 @@ TEST_CASE("dict robust iteration")
 				CHECK(false);
 				break;
 			}
+
 		count++;
+		delete it_key;
 		}
 
 	CHECK(count == 3);
@@ -350,7 +352,9 @@ TEST_CASE("dict robust iteration")
 				CHECK(false);
 				break;
 			}
+
 		count++;
+		delete it_key;
 		}
 
 	CHECK(count == 2);
